@@ -1,41 +1,76 @@
 """Utilities for benchmarks."""
 
+from dataclasses import dataclass
 import gzip
 import json
-import jax
-import numpy as np
 import os
 import pathlib
 import re
+from typing import Any, Callable
+import jax
+import numpy as np
 
-from dataclasses import dataclass
-from typing import Callable
 
 @dataclass
 class BenchmarkResult:
+  """The result of a benchmark run.
+
+  Attributes:
+    time_median: the median elapsed time of the benchmark at the event level. By
+      default, the event to be measured is equivalent to the function to be
+      benchmarked, unless an event_matcher is provided.
+    time_min: the minimum elapsed time of the benchmark.
+  """
+
   time_median: float = 0
   time_min: float = 0
 
 
-def get_trace(log_dir: str) -> dict:
-  # Navigate to folder with the latest trace dump to find `trace.json.jz`
-  trace_folders = (pathlib.Path(log_dir).absolute() / "plugins" / "profile").iterdir()
+def get_trace(log_dir: str) -> dict[str, Any]:
+  """Extract the trace object from the log directory.
+
+  If multiple profiles exist in the directory, the lastest one will be used.
+
+  Args:
+    log_dir: log directory created by jax.profiler.trace().
+
+  Returns:
+    A trace object in JSON format.
+  """
+  # Navigate to the folder with the latest trace dump to find `trace.json.jz`
+  trace_folders = (
+      pathlib.Path(log_dir).absolute() / "plugins" / "profile"
+  ).iterdir()
   latest_trace_folder = max(trace_folders, key=os.path.getmtime)
   trace_jsons = latest_trace_folder.glob("*.trace.json.gz")
   try:
-    trace_json, = trace_jsons
+    (trace_json,) = trace_jsons
   except ValueError as value_error:
-    raise ValueError(f"Invalid trace folder: {latest_trace_folder}") from value_error
+    raise ValueError(
+        f"Invalid trace folder: {latest_trace_folder}"
+    ) from value_error
 
   with gzip.open(trace_json, "rb") as f:
     trace = json.load(f)
-  
+
   return trace
 
 
-def get_eligible_events(trace: dict, event_matcher: re.Pattern = None) -> list[dict]:
-  if not "traceEvents" in trace:
-    raise KeyError(f"Key 'traceEvents' not found in trace.")
+def get_eligible_events(
+    trace: dict[str, Any],
+    event_matcher: re.Pattern[str],
+) -> list[dict[str, Any]]:
+  """Filter the trace events eligible for benchmarking.
+
+  Args:
+    trace: a trace object in JSON format.
+    event_matcher: a regex-based event name matcher to filter the evnets.
+
+  Returns:
+    A list of events objects in JSON format.
+  """
+  if "traceEvents" not in trace:
+    raise KeyError("Key 'traceEvents' not found in trace.")
 
   ret = []
   for e in trace["traceEvents"]:
@@ -44,19 +79,53 @@ def get_eligible_events(trace: dict, event_matcher: re.Pattern = None) -> list[d
   return ret
 
 
-def get_benchmark_result(events: list[dict]):
+def get_benchmark_result(events: list[dict[str, Any]]) -> BenchmarkResult:
+  """Derive the benchmark result from the given list of trace events.
+
+  Args:
+    events: a list of trace events.
+
+  Returns:
+    A summary of the benchmark result.
+  """
   try:
     durations = [e["dur"] / 1e6 for e in events]
-  except KeyError as ker_error:
-    raise ker_error
-  
+  except KeyError:
+    print("KeyError: Key 'dur' not found in the event object")
+    raise
+
   return BenchmarkResult(
-    time_median=np.median(durations),
-    time_min=np.min(durations),
+      time_median=np.median(durations),
+      time_min=np.min(durations),
   )
 
 
-def run_bench(fn: Callable, num_iter=1, warmup_iter=0, log_dir="/tmp", event_label="my_func", event_matcher: re.Pattern = None):
+def run_bench(
+    fn: Callable[..., Any],
+    num_iter: int,
+    warmup_iter: int,
+    log_dir: str,
+    func_label: str,
+    event_matcher: re.Pattern[str] = None,
+) -> BenchmarkResult:
+  """Runs a function `num_iter` times to measure the runtime for benchmarking.
+
+  A jax profiler trace is captured in order to measure the timing at the event
+  level within the function.
+
+  Args:
+    fn: the function to be benchmarked.
+    num_iter: number of times `fn` will be run.
+    warmup_iter: number of times `fn` will be run before the acutal timing
+      measurement.
+    log_dir: the directory to save the profiler trace to.
+    func_label: a label to identify the function in the trace events.
+    event_matcher: a regex-based event matcher to filter the evnets eligible for
+      benchmarking. If None, the runtime of the function will be reported.
+
+  Returns:
+    A summary of the benchmark result.
+  """
   # warm up
   for _ in range(warmup_iter):
     fn()
@@ -64,13 +133,13 @@ def run_bench(fn: Callable, num_iter=1, warmup_iter=0, log_dir="/tmp", event_lab
   with jax.profiler.trace(log_dir):
     for _ in range(num_iter):
       jax.clear_caches()
-      with jax.profiler.TraceAnnotation(event_label):
+      with jax.profiler.TraceAnnotation(func_label):
         fn()
-  
+
   trace = get_trace(log_dir)
 
   if not event_matcher:
-    event_matcher = re.compile(event_label)
+    event_matcher = re.compile(func_label)
   events = get_eligible_events(trace, event_matcher)
   assert len(events) == num_iter
 
